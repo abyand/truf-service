@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"sync"
 )
 
@@ -40,14 +41,12 @@ func main() {
 func handleInitialConnection(conn net.Conn) {
 	defer conn.Close()
 	scanner := bufio.NewScanner(conn)
-	// Ask for username
 	conn.Write([]byte("Enter username: "))
 	if !scanner.Scan() {
 		fmt.Println("Error reading username")
 		return
 	}
 	username := scanner.Text()
-	// Ask for socket ID
 	conn.Write([]byte("Enter socket ID: "))
 	if !scanner.Scan() {
 		fmt.Println("Error reading socket ID")
@@ -56,33 +55,54 @@ func handleInitialConnection(conn net.Conn) {
 	socketID := scanner.Text()
 	client := Client{Conn: conn, Username: username, Ready: false}
 	mutex.Lock()
+	if len(connections[socketID]) >= 4 {
+		mutex.Unlock()
+		conn.Write([]byte("Sorry, the maximum number of players in a game has been reached.\n"))
+		return
+	}
 	connections[socketID] = append(connections[socketID], client)
 	mutex.Unlock()
 	fmt.Printf("Client %s connected to socket ID: %s\n", username, socketID)
-	conn.Write([]byte("Enter 'ready' to signify readiness or 'check' to check the status of the other players.\n"))
+	conn.Write([]byte("Enter '/ready' to signify readiness, '/check' to check the status of the other players, '/chat' followed by your message to chat, '/help' to see these instructions again.\n"))
 	handleConnection(client, socketID)
 }
 
 func handleConnection(client Client, socketID string) {
 	scanner := bufio.NewScanner(client.Conn)
 	for scanner.Scan() {
-		message := scanner.Text()
-		switch message {
+		message := strings.SplitN(scanner.Text(), " ", 2)
+		switch message[0] {
 		case "/ready":
 			mutex.Lock()
+			allReady := true
 			for i := range connections[socketID] {
 				if connections[socketID][i].Conn == client.Conn {
 					connections[socketID][i].Ready = true
 					client.Conn.Write([]byte("Yeay, you're ready!\n"))
 				}
+				if !connections[socketID][i].Ready {
+					allReady = false
+				}
+			}
+			if allReady && len(connections[socketID]) == 4 {
+				for i := range connections[socketID] {
+					connections[socketID][i].Conn.Write([]byte("Yeay all the players are ready, let's get this game started\n"))
+				}
 			}
 			mutex.Unlock()
 		case "/check":
 			checkPlayers(client, socketID)
+		case "/chat":
+			if len(message) > 1 {
+				fullMessage := fmt.Sprintf("%s: %s", client.Username, message[1])
+				fmt.Printf("Received message on socket ID %s: %s\n", socketID, fullMessage)
+				broadcastMessage(socketID, client, fullMessage)
+			}
+		case "/help":
+			client.Conn.Write([]byte("Enter '/ready' to signify readiness, '/check' to check the status of the other players, '/chat' followed by your message to chat, '/help' to see these instructions again.\n"))
 		default:
-			fullMessage := fmt.Sprintf("%s: %s", client.Username, message)
-			fmt.Printf("Received message on socket ID %s: %s\n", socketID, fullMessage)
-			broadcastMessage(socketID, client, fullMessage)
+			fullMessage := fmt.Sprintf("Unrecognized command: '%s'. For list of commands type /help", scanner.Text())
+			client.Conn.Write([]byte(fullMessage + "\n"))
 		}
 	}
 	if err := scanner.Err(); err != nil {
