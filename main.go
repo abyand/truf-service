@@ -8,12 +8,13 @@ import (
 	"net"
 	"os"
 	"sort"
-	"strings"
+	"strconv"
 	"sync"
 	"time"
 )
 
 type Card struct {
+	ID       int
 	Suit     string
 	Value    string
 	SuitNum  int // 0 => "♥", 1 => "♦", 2 => "♣", 3 => "♠"
@@ -21,16 +22,38 @@ type Card struct {
 }
 
 type Client struct {
-	Conn     net.Conn
-	Username string
-	Ready    bool
-	Hand     []Card
+	Conn        net.Conn
+	Username    string
+	Ready       bool
+	Hand        []Card
+	BiddingCard Card
+}
+
+type Room struct {
+	id         string
+	Clients    []Client
+	State      string
+	InnerState string
+	Round      int
+	MaxBid     Card
+	Truf       string
 }
 
 var (
-	connections = make(map[string][]Client)
-	mutex       = &sync.Mutex{}
+	rooms = make(map[string]*Room)
+	mutex = &sync.Mutex{}
 )
+
+var data struct {
+	Username string `json:"username"`
+	SocketID string `json:"socketId"`
+}
+
+var socketCommand struct {
+	SocketID string `json:"socketId"`
+	Command  string `json:"command"`
+	MetaData string `json:"metadata"`
+}
 
 func main() {
 	listener, err := net.Listen("tcp", ":8080")
@@ -51,99 +74,170 @@ func main() {
 }
 
 func handleInitialConnection(conn net.Conn) {
-	defer conn.Close()
 	scanner := bufio.NewScanner(conn)
-	conn.Write([]byte("Enter username: "))
-	if !scanner.Scan() {
-		fmt.Println("Error reading username")
-		return
-	}
-	username := scanner.Text()
-	conn.Write([]byte("Enter socket ID: "))
-	if !scanner.Scan() {
-		fmt.Println("Error reading socket ID")
-		return
-	}
-	socketID := scanner.Text()
-	client := Client{Conn: conn, Username: username, Ready: false}
-	mutex.Lock()
-	if len(connections[socketID]) >= 4 {
+	if scanner.Scan() {
+		payload := scanner.Text()
+		json.Unmarshal([]byte(payload), &data)
+		username := data.Username
+		socketID := data.SocketID
+		client := Client{Conn: conn, Username: username, Ready: false}
+		mutex.Lock()
+		if rooms[socketID] == nil {
+			rooms[socketID] = &Room{State: "pregame", id: socketID}
+		}
+		if len(rooms[socketID].Clients) >= 4 {
+			mutex.Unlock()
+			conn.Write([]byte("Sorry, the maximum number of players in a game has been reached.\n"))
+			return
+		}
+		rooms[socketID].Clients = append(rooms[socketID].Clients, client)
 		mutex.Unlock()
-		conn.Write([]byte("Sorry, the maximum number of players in a game has been reached.\n"))
-		return
+		conn.Write([]byte("Welcome to room " + socketID + ", " + username + "!\n"))
+		go handleConnection(client.Username, socketID)
 	}
-	connections[socketID] = append(connections[socketID], client)
-	mutex.Unlock()
-	fmt.Printf("Client %s connected to socket ID: %s\n", username, socketID)
-	conn.Write([]byte("Enter '/ready' to signify readiness, '/check' to check the status of the other players, '/chat' followed by your message to chat, '/help' to see these instructions again.\n"))
-	handleConnection(client, socketID)
 }
 
-func handleConnection(client Client, socketID string) {
+func handleConnection(username string, socketID string) {
+	client, err := findClient(username, socketID)
+	if err != nil {
+		return
+	}
 	scanner := bufio.NewScanner(client.Conn)
 	for scanner.Scan() {
-		message := strings.SplitN(scanner.Text(), " ", 2)
-		switch message[0] {
-		case "/ready":
-			mutex.Lock()
-			allReady := true
-			for i := range connections[socketID] {
-				if connections[socketID][i].Conn == client.Conn {
-					connections[socketID][i].Ready = true
-					client.Conn.Write([]byte("Yeay, you're ready!\n"))
+		mutex.Lock()
+		payload := scanner.Text()
+		json.Unmarshal([]byte(payload), &socketCommand)
+		command := socketCommand.Command
+		socketID := socketCommand.SocketID
+		metadata := socketCommand.MetaData
+		socketRoom := rooms[socketID]
+
+		switch socketRoom.State {
+		case "pregame":
+			switch command {
+			case "/ready":
+				// Find the client in the room, to update their ready status
+				for i, roomClient := range socketRoom.Clients {
+					if roomClient.Username == client.Username {
+						socketRoom.Clients[i].Ready = true
+						broadCastToClient("Yeay, you're ready!\n", socketID, client)
+						broadCastToOthers(roomClient.Username+" is ready\n", socketID, client)
+					}
 				}
-				if !connections[socketID][i].Ready {
-					allReady = false
+				if canStartTheGame(socketID) {
+					startTheGame(socketRoom, client)
 				}
+			case "/check":
+				checkPlayers(client, socketID)
+			case "/chat":
+				fullMessage := fmt.Sprintf("%s: %s", client.Username, metadata)
+				fmt.Printf("Received message on socket ID %s: %s\n", socketID, fullMessage)
+				broadCastToOthers(fullMessage, socketID, client)
+			case "/help":
+				broadCastToClient(
+					"Enter \n'/ready' to signify readiness \n'/check' to check the status of the other players \n'/chat' followed by your message to chat \n'/help' to see these instructions again.\n",
+					socketID,
+					client)
+			default:
+				fullMessage := fmt.Sprintf("Unrecognized socketCommand: '%s'. For list of commands type /help", scanner.Text())
+				broadCastToClient(fullMessage, socketID, client)
 			}
-			if allReady && len(connections[socketID]) == 4 {
-				deck := dealCards(connections[socketID])
-				for i := range connections[socketID] {
-					cardsData, _ := json.Marshal(connections[socketID][i].Hand)
-					msg := fmt.Sprintf(
-						"All players are ready, game has started. Here are your cards: %s\nCards remaining in deck: %d\n",
-						string(cardsData),
-						len(deck),
-					)
-					for j, otherClient := range connections[socketID] {
-						if j != i {
-							msg += fmt.Sprintf("Total cards %s has: %d\n", otherClient.Username, len(otherClient.Hand))
+		case "ingame":
+			switch socketRoom.InnerState {
+			case "bid":
+				cardId, err := strconv.Atoi(metadata)
+				if err != nil {
+					fmt.Println("Could not convert string to int")
+					broadCastToClient("Could not convert string to int: "+err.Error(), socketID, client)
+				} else {
+					card, err := getCardByID(client, cardId)
+					if err != nil {
+						broadCastToClient("error: "+err.Error(), socketID, client)
+					} else {
+						client.BiddingCard = card
+						client.Ready = true
+						broadCastToClient("successfully bid card "+getCardFormat(card), socketID, client)
+						broadCastToOthers(client.Username+" has submit bid", socketID, client)
+
+						if allBid(socketRoom) {
+
 						}
 					}
-					connections[socketID][i].Conn.Write([]byte(msg))
 				}
+			case "play":
+				broadCastToAll("play", socketID)
+			case "score":
+				broadCastToAll("score", socketID)
 			}
-			mutex.Unlock()
-		case "/check":
-			checkPlayers(client, socketID)
-		case "/chat":
-			if len(message) > 1 {
-				fullMessage := fmt.Sprintf("%s: %s", client.Username, message[1])
-				fmt.Printf("Received message on socket ID %s: %s\n", socketID, fullMessage)
-				broadcastMessage(socketID, client, fullMessage)
-			}
-		case "/help":
-			client.Conn.Write([]byte("Enter '/ready' to signify readiness, '/check' to check the status of the other players, '/chat' followed by your message to chat, '/help' to see these instructions again.\n"))
-		default:
-			fullMessage := fmt.Sprintf("Unrecognized command: '%s'. For list of commands type /help", scanner.Text())
-			client.Conn.Write([]byte(fullMessage + "\n"))
+			broadCastToAll("ingame", socketID)
+		case "postgame":
+			broadCastToAll("postgame", socketID)
 		}
+
+		mutex.Unlock()
 	}
 	if err := scanner.Err(); err != nil {
 		fmt.Println("Error reading from connection:", err)
 	}
 	mutex.Lock()
-	connections[socketID] = removeConnection(connections[socketID], client)
+	rooms[socketID].Clients = removeConnection(rooms[socketID].Clients, client)
 	mutex.Unlock()
 	client.Conn.Close()
 }
 
+func findClient(username string, id string) (Client, error) {
+	for i := range rooms[id].Clients {
+		if rooms[id].Clients[i].Username == username {
+			return rooms[id].Clients[i], nil
+		}
+	}
+	return Client{}, fmt.Errorf("client with username %d not found", username)
+}
+
+func allBid(room *Room) bool {
+	for i := range room.Clients {
+		if !room.Clients[i].Ready {
+			return false
+		}
+	}
+	return true
+}
+
+func startTheGame(socketRoom *Room, client Client) {
+	socketRoom.State = "ingame"
+	socketRoom.Round = 1
+	dealCards(socketRoom.Clients)
+	for i := range socketRoom.Clients {
+		socketRoom.Clients[i].Ready = false
+		cardsData, _ := json.Marshal(socketRoom.Clients[i].Hand)
+		msg := fmt.Sprintf(
+			"All players are ready, game has started. Here are your cards: %s\n",
+			string(cardsData),
+		)
+		for j, otherClient := range socketRoom.Clients {
+			if j != i {
+				msg += fmt.Sprintf("Total cards %s has: %d\n", otherClient.Username, len(otherClient.Hand))
+			}
+		}
+		broadCastToClient(msg, socketRoom.id, socketRoom.Clients[i])
+	}
+	socketRoom.InnerState = "bid"
+}
+
+func canStartTheGame(id string) bool {
+	allReady := true
+	for _, roomClient := range rooms[id].Clients {
+		if !roomClient.Ready {
+			allReady = false
+		}
+	}
+	return allReady
+}
+
 func checkPlayers(requester Client, socketID string) {
-	mutex.Lock()
-	defer mutex.Unlock()
 	var response string
 	response += "Checking status of members in the socket...\n"
-	for _, client := range connections[socketID] {
+	for _, client := range rooms[socketID].Clients {
 		var status string
 		if client.Ready {
 			status = "is ready"
@@ -154,19 +248,6 @@ func checkPlayers(requester Client, socketID string) {
 		response += playerStatus
 	}
 	requester.Conn.Write([]byte(response))
-}
-
-func broadcastMessage(socketID string, sender Client, message string) {
-	mutex.Lock()
-	defer mutex.Unlock()
-	for _, client := range connections[socketID] {
-		if client.Conn != sender.Conn {
-			_, err := client.Conn.Write([]byte(message + "\n"))
-			if err != nil {
-				fmt.Println("Error writing to connection:", err)
-			}
-		}
-	}
 }
 
 func removeConnection(slice []Client, client Client) []Client {
@@ -184,9 +265,11 @@ func createDeck() []Card {
 	valueNums := []int{2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
 	var deck []Card
 
+	id := 0
 	for i, suit := range suits {
 		for j, value := range values {
-			deck = append(deck, Card{Suit: suit, Value: value, SuitNum: i, ValueNum: valueNums[j]})
+			deck = append(deck, Card{ID: id, Suit: suit, Value: value, SuitNum: i, ValueNum: valueNums[j]})
+			id++
 		}
 	}
 	rand.Seed(time.Now().UnixNano())
@@ -225,4 +308,44 @@ func validateHand(hand []Card) bool {
 		}
 	}
 	return len(suitCount) == 4 && hasCardBiggerThan10
+}
+
+func broadCastToAll(message string, socketID string) {
+	for _, client := range rooms[socketID].Clients {
+		_, err := client.Conn.Write([]byte(message + "\n"))
+		if err != nil {
+			fmt.Println("Error writing to connection:", err)
+		}
+	}
+}
+
+func broadCastToOthers(message string, socketID string, sender Client) {
+	for _, client := range rooms[socketID].Clients {
+		if client.Conn != sender.Conn {
+			_, err := client.Conn.Write([]byte(message + "\n"))
+			if err != nil {
+				fmt.Println("Error writing to connection:", err)
+			}
+		}
+	}
+}
+
+func broadCastToClient(message string, socketID string, sender Client) {
+	_, err := sender.Conn.Write([]byte(message + "\n"))
+	if err != nil {
+		fmt.Println("Error writing to connection:", err)
+	}
+}
+
+func getCardByID(client Client, cardID int) (Card, error) {
+	for _, card := range client.Hand {
+		if card.ID == cardID {
+			return card, nil
+		}
+	}
+	return Card{}, fmt.Errorf("card with ID %d not found", cardID)
+}
+
+func getCardFormat(card Card) string {
+	return card.Value + card.Suit
 }
