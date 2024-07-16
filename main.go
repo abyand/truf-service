@@ -98,19 +98,24 @@ func handleInitialConnection(conn net.Conn) {
 }
 
 func handleConnection(username string, socketID string) {
-	client, err := findClient(username, socketID)
+	tempClient, err := findClient(username, socketID)
 	if err != nil {
 		return
 	}
-	scanner := bufio.NewScanner(client.Conn)
+	scanner := bufio.NewScanner(tempClient.Conn)
 	for scanner.Scan() {
 		mutex.Lock()
+		client, err := findClient(username, socketID)
+		if err != nil {
+			return
+		}
 		payload := scanner.Text()
 		json.Unmarshal([]byte(payload), &socketCommand)
 		command := socketCommand.Command
 		socketID := socketCommand.SocketID
 		metadata := socketCommand.MetaData
 		socketRoom := rooms[socketID]
+		fmt.Println("client address: " + client.Conn.RemoteAddr().String() + " with payload: " + payload)
 
 		switch socketRoom.State {
 		case "pregame":
@@ -120,8 +125,8 @@ func handleConnection(username string, socketID string) {
 				for i, roomClient := range socketRoom.Clients {
 					if roomClient.Username == client.Username {
 						socketRoom.Clients[i].Ready = true
-						broadCastToClient("Yeay, you're ready!\n", socketID, client)
-						broadCastToOthers(roomClient.Username+" is ready\n", socketID, client)
+						broadCastToClient("Yeay, you're ready!", socketID, client)
+						broadCastToOthers(roomClient.Username+" is ready", socketID, client)
 					}
 				}
 				if canStartTheGame(socketID) {
@@ -135,7 +140,7 @@ func handleConnection(username string, socketID string) {
 				broadCastToOthers(fullMessage, socketID, client)
 			case "/help":
 				broadCastToClient(
-					"Enter \n'/ready' to signify readiness \n'/check' to check the status of the other players \n'/chat' followed by your message to chat \n'/help' to see these instructions again.\n",
+					"Enter \n'/ready' to signify readiness \n'/check' to check the status of the other players \n'/chat' followed by your message to chat \n'/help' to see these instructions again.",
 					socketID,
 					client)
 			default:
@@ -149,20 +154,27 @@ func handleConnection(username string, socketID string) {
 				if err != nil {
 					fmt.Println("Could not convert string to int")
 					broadCastToClient("Could not convert string to int: "+err.Error(), socketID, client)
-				} else {
-					card, err := getCardByID(client, cardId)
-					if err != nil {
-						broadCastToClient("error: "+err.Error(), socketID, client)
-					} else {
-						client.BiddingCard = card
-						client.Ready = true
-						broadCastToClient("successfully bid card "+getCardFormat(card), socketID, client)
-						broadCastToOthers(client.Username+" has submit bid", socketID, client)
+					continue
+				}
+				card, err := getCardByID(client, cardId)
+				if err != nil {
+					broadCastToClient("error: "+err.Error(), socketID, client)
+					continue
+				}
+				client.BiddingCard = card
+				client.Ready = true
+				broadCastToClient("successfully bid card "+getCardFormat(card), socketID, client)
+				broadCastToOthers(client.Username+" has submit bid", socketID, client)
 
-						if allBid(socketRoom) {
-
-						}
+				if allBid(socketRoom) {
+					broadCastToAll("all bid submitted, revealing the bid..", socketID)
+					// Revealing the bid
+					for _, client := range socketRoom.Clients {
+						broadCastToAll(fmt.Sprintf("Player %s bid: %s", client.Username, getCardFormat(client.BiddingCard)), socketID)
 					}
+					socketRoom.Truf = getTruf(socketRoom)
+					//broadCastToAll("this round truf will be")
+
 				}
 			case "play":
 				broadCastToAll("play", socketID)
@@ -180,9 +192,13 @@ func handleConnection(username string, socketID string) {
 		fmt.Println("Error reading from connection:", err)
 	}
 	mutex.Lock()
-	rooms[socketID].Clients = removeConnection(rooms[socketID].Clients, client)
+	rooms[socketID].Clients = removeConnection(rooms[socketID].Clients, tempClient)
 	mutex.Unlock()
-	client.Conn.Close()
+	tempClient.Conn.Close()
+}
+
+func getTruf(room *Room) string {
+	return "truf"
 }
 
 func findClient(username string, id string) (Client, error) {
